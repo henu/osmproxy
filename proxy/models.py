@@ -11,6 +11,8 @@ class Chunk(models.Model):
 
     data = models.BinaryField()
 
+    custom_data = models.BinaryField(null=True, blank=True, default=None)
+
     class Meta:
         unique_together = (('lat', 'lon'))
         index_together = (('lat', 'lon'))

@@ -1,33 +1,32 @@
-from decimal import Decimal, ROUND_HALF_UP
-import requests
+from decimal import Decimal
+import importlib
 import struct
 import xml.etree.ElementTree as ETree
 
+import requests
+
+from django.conf import settings
 from django.http import HttpResponseBadRequest, HttpResponse
 
 from proxy.models import Chunk
+from proxy.utils import lat_to_int, lon_to_int, bytes_to_rich_data
 
 
 def get_chunk(request):
+
+    def get_str_id(strcache, s):
+        try:
+            return strcache.index(s)
+        except ValueError:
+            strcache.append(s)
+            return len(strcache) - 1
+
     BOUNDINGBOX_EXTRA = Decimal('0.008')
+
+    func_path = getattr(settings, 'CUSTOM_CHUNK_SERIALIZATION_FUNCTION', None)
 
     lat = int(request.GET.get('lat'))
     lon = int(request.GET.get('lon'))
-
-    def lat_to_int(lat):
-        lat = int((Decimal(lat) * 10000000).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
-        return min(900000000, max(-900000000, lat))
-
-    def lon_to_int(lon):
-        lon = int((Decimal(lon) * 10000000).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
-        return (lon + 1800000000) % 3600000000 - 1800000000
-
-    def get_str_id(strcache, str):
-        try:
-            return strcache.index(str)
-        except ValueError:
-            strcache.append(str)
-            return len(strcache) - 1
 
     if lat is None or lon is None:
         return HttpResponseBadRequest('Missing GET argument "lat" or "lon"!')
@@ -42,6 +41,9 @@ def get_chunk(request):
 
     chunk = Chunk.objects.filter(lat=lat, lon=lon).first()
     if chunk:
+        # If custom data should be returned instead
+        if func_path:
+            return HttpResponse(chunk.custom_data, content_type='application/octet-stream')
         return HttpResponse(chunk.data, content_type='application/octet-stream')
 
     # Chunk does not exist, so it must be loaded
@@ -135,10 +137,21 @@ def get_chunk(request):
     data += nodes_bytes
     data += ways_bytes
 
+    # If custom data should be built
+    custom_data = None
+    if func_path:
+        mod_name, func_name = func_path.rsplit('.', 1)
+        mod = importlib.import_module(mod_name)
+        func = getattr(mod, func_name)
+        custom_data = func(bytes_to_rich_data(data))
+
     Chunk.objects.create(
         lat=lat,
         lon=lon,
-        data=data
+        data=data,
+        custom_data=custom_data,
     )
 
+    if func_path:
+        return HttpResponse(custom_data, content_type='application/octet-stream')
     return HttpResponse(data, content_type='application/octet-stream')
