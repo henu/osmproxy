@@ -12,6 +12,9 @@ from proxy.models import Chunk
 from proxy.utils import lat_to_int, lon_to_int, bytes_to_rich_data
 
 
+CHUNK_WIDTH_MULTIPLIER = getattr(settings, 'CHUNK_WIDTH_MULTIPLIER', 1)
+
+
 def get_chunk(request):
 
     def get_str_id(strcache, s):
@@ -36,6 +39,8 @@ def get_chunk(request):
     if lat < -9000 or lat >= 9000:
         return HttpResponseBadRequest('Invalid latitude!')
     lon = (lon + 18000) % 36000 - 18000
+    if lat % CHUNK_WIDTH_MULTIPLIER != 0 or lon % CHUNK_WIDTH_MULTIPLIER != 0:
+        return HttpResponseBadRequest('"lat" or "lon" must be multiples of {}!'.format(CHUNK_WIDTH_MULTIPLIER))
     lat_d = Decimal(lat) / Decimal(100)
     lon_d = Decimal(lon) / Decimal(100)
 
@@ -48,9 +53,9 @@ def get_chunk(request):
 
     # Chunk does not exist, so it must be loaded
     bb_lat_min = lat_d - BOUNDINGBOX_EXTRA
-    bb_lat_max = lat_d + Decimal('0.01') + BOUNDINGBOX_EXTRA
+    bb_lat_max = lat_d + Decimal('0.01') * CHUNK_WIDTH_MULTIPLIER + BOUNDINGBOX_EXTRA
     bb_lon_min = lon_d - BOUNDINGBOX_EXTRA
-    bb_lon_max = lon_d + Decimal('0.01') + BOUNDINGBOX_EXTRA
+    bb_lon_max = lon_d + Decimal('0.01') * CHUNK_WIDTH_MULTIPLIER + BOUNDINGBOX_EXTRA
 
     # Fetch nodes
     query = """
