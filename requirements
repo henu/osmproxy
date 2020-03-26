@@ -1,3 +1,5 @@
 Django<3.1
 mysqlclient
 requests
+python-memcached
+django-cache-lock

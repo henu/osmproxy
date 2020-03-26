@@ -3,9 +3,11 @@ import importlib
 import struct
 import xml.etree.ElementTree as ETree
 
+from django_lock import lock
 import requests
 
 from django.conf import settings
+from django.core.cache import cache
 from django.http import HttpResponseBadRequest, HttpResponse
 
 from proxy.models import Chunk
@@ -44,118 +46,140 @@ def get_chunk(request):
     lat_d = Decimal(lat) / Decimal(100)
     lon_d = Decimal(lon) / Decimal(100)
 
-    chunk = Chunk.objects.filter(lat=lat, lon=lon).first()
-    if chunk:
-        # If custom data should be returned instead
+    with lock('get_chunk_{}_{}'.format(lat, lon)):
+        chunk = Chunk.objects.filter(lat=lat, lon=lon).first()
+        if chunk:
+            # If custom data should be returned instead
+            if func_path:
+                return HttpResponse(chunk.custom_data, content_type='application/octet-stream')
+            return HttpResponse(chunk.data, content_type='application/octet-stream')
+
+        # Check if we should give some rest to Overpass API
+        if cache.get('dont_call_overpass_api'):
+            return HttpResponse(b'', content_type='application/octet-stream', status=503)
+
+        # Make sure Overpass API has some free slots
+        with lock('check_overpass_api_slots'):
+            response = requests.get('http://overpass-api.de/api/status')
+            if response.status_code < 200 or response.status_code > 299:
+                # There was some error, so do not try again for a while
+                cache.set('dont_call_overpass_api', 'x', 5)
+                return HttpResponse(b'', content_type='application/octet-stream', status=503)
+            if 'slots available now' not in response.content.decode('utf8'):
+                # There are no free slots, so wait for a while
+                cache.set('dont_call_overpass_api', 'x', 1)
+                return HttpResponse(b'', content_type='application/octet-stream', status=503)
+
+        # Chunk does not exist, so it must be loaded
+        bb_lat_min = lat_d - BOUNDINGBOX_EXTRA
+        bb_lat_max = lat_d + Decimal('0.01') * CHUNK_WIDTH_MULTIPLIER + BOUNDINGBOX_EXTRA
+        bb_lon_min = lon_d - BOUNDINGBOX_EXTRA
+        bb_lon_max = lon_d + Decimal('0.01') * CHUNK_WIDTH_MULTIPLIER + BOUNDINGBOX_EXTRA
+
+        # Fetch nodes
+        query = """
+            <query type="node">
+                <bbox-query s="{bb_lat_min}" n="{bb_lat_max}" w="{bb_lon_min}" e="{bb_lon_max}"/>
+            </query>
+            <print/>
+        """.format(
+            bb_lat_min=bb_lat_min,
+            bb_lat_max=bb_lat_max,
+            bb_lon_min=bb_lon_min,
+            bb_lon_max=bb_lon_max,
+        )
+        try:
+            response = requests.post('http://overpass-api.de/api/interpreter', data=query)
+        except requests.exceptions.ConnectionError:
+            # Allow Overpass API to have some rest
+            cache.set('dont_call_overpass_api', 'x', 20)
+            return HttpResponse(b'', content_type='application/octet-stream', status=503)
+        nodes_xml = ETree.fromstring(response.text)
+
+        # Fetch ways
+        query = """
+            <query type="way">
+                <bbox-query s="{bb_lat_min}" n="{bb_lat_max}" w="{bb_lon_min}" e="{bb_lon_max}"/>
+            </query>
+            <print/>
+        """.format(
+            bb_lat_min=bb_lat_min,
+            bb_lat_max=bb_lat_max,
+            bb_lon_min=bb_lon_min,
+            bb_lon_max=bb_lon_max,
+        )
+        response = requests.post('http://overpass-api.de/api/interpreter', data=query)
+        ways_xml = ETree.fromstring(response.text)
+
+        # Prepare string cache. This is used to reduce space
+        # waste of strings that occur multiple times.
+        strcache = []
+
+        # Convert nodes to bytes
+        nodes_bytes = b''
+        nodes_xml = list(nodes_xml.findall('node'))
+        nodes_bytes += struct.pack('>I', len(nodes_xml))
+        for node_xml in nodes_xml:
+            # ID
+            nodes_bytes += struct.pack('>Q', int(node_xml.get('id')))
+            # Latitude and longitude
+            nodes_bytes += struct.pack('>ii', lat_to_int(node_xml.get('lat')), lon_to_int(node_xml.get('lon')))
+            # Tags
+            tags_xml = list(node_xml.findall('tag'))
+            nodes_bytes += struct.pack('>H', len(tags_xml))
+            for tag_xml in tags_xml:
+                key = get_str_id(strcache, tag_xml.get('k'))
+                value = get_str_id(strcache, tag_xml.get('v'))
+                nodes_bytes += struct.pack('>HH', key, value)
+
+        # Convert ways to bytes
+        ways_bytes = b''
+        ways_xml = list(ways_xml.findall('way'))
+        ways_bytes += struct.pack('>I', len(ways_xml))
+        for way_xml in ways_xml:
+            # ID
+            ways_bytes += struct.pack('>Q', int(way_xml.get('id')))
+            # Nodes
+            way_nodes_xml = way_xml.findall('nd')
+            ways_bytes += struct.pack('>H', len(way_nodes_xml))
+            for way_node_xml in way_nodes_xml:
+                ways_bytes += struct.pack('>Q', int(way_node_xml.get('ref')))
+            # Tags
+            tags_xml = list(way_xml.findall('tag'))
+            ways_bytes += struct.pack('>H', len(tags_xml))
+            for tag_xml in tags_xml:
+                key = get_str_id(strcache, tag_xml.get('k'))
+                value = get_str_id(strcache, tag_xml.get('v'))
+                ways_bytes += struct.pack('>HH', key, value)
+
+        # Form the final bytes
+        data = b''
+        # Version
+        data += struct.pack('>H', 0)
+        # String cache
+        data += struct.pack('>H', len(strcache))
+        for s in strcache:
+            s = s.encode('utf8')
+            data += struct.pack('>H', len(s))
+            data += s
+        # Nodes and ways
+        data += nodes_bytes
+        data += ways_bytes
+
+        # If custom data should be built
+        custom_data = None
         if func_path:
-            return HttpResponse(chunk.custom_data, content_type='application/octet-stream')
-        return HttpResponse(chunk.data, content_type='application/octet-stream')
+            mod_name, func_name = func_path.rsplit('.', 1)
+            mod = importlib.import_module(mod_name)
+            func = getattr(mod, func_name)
+            custom_data = func(bytes_to_rich_data(data))
 
-    # Chunk does not exist, so it must be loaded
-    bb_lat_min = lat_d - BOUNDINGBOX_EXTRA
-    bb_lat_max = lat_d + Decimal('0.01') * CHUNK_WIDTH_MULTIPLIER + BOUNDINGBOX_EXTRA
-    bb_lon_min = lon_d - BOUNDINGBOX_EXTRA
-    bb_lon_max = lon_d + Decimal('0.01') * CHUNK_WIDTH_MULTIPLIER + BOUNDINGBOX_EXTRA
-
-    # Fetch nodes
-    query = """
-        <query type="node">
-            <bbox-query s="{bb_lat_min}" n="{bb_lat_max}" w="{bb_lon_min}" e="{bb_lon_max}"/>
-        </query>
-        <print/>
-    """.format(
-        bb_lat_min=bb_lat_min,
-        bb_lat_max=bb_lat_max,
-        bb_lon_min=bb_lon_min,
-        bb_lon_max=bb_lon_max,
-    )
-    response = requests.post('http://overpass-api.de/api/interpreter', data=query)
-    nodes_xml = ETree.fromstring(response.text)
-
-    # Fetch ways
-    query = """
-        <query type="way">
-            <bbox-query s="{bb_lat_min}" n="{bb_lat_max}" w="{bb_lon_min}" e="{bb_lon_max}"/>
-        </query>
-        <print/>
-    """.format(
-        bb_lat_min=bb_lat_min,
-        bb_lat_max=bb_lat_max,
-        bb_lon_min=bb_lon_min,
-        bb_lon_max=bb_lon_max,
-    )
-    response = requests.post('http://overpass-api.de/api/interpreter', data=query)
-    ways_xml = ETree.fromstring(response.text)
-
-    # Prepare string cache. This is used to reduce space
-    # waste of strings that occur multiple times.
-    strcache = []
-
-    # Convert nodes to bytes
-    nodes_bytes = b''
-    nodes_xml = list(nodes_xml.findall('node'))
-    nodes_bytes += struct.pack('>I', len(nodes_xml))
-    for node_xml in nodes_xml:
-        # ID
-        nodes_bytes += struct.pack('>Q', int(node_xml.get('id')))
-        # Latitude and longitude
-        nodes_bytes += struct.pack('>ii', lat_to_int(node_xml.get('lat')), lon_to_int(node_xml.get('lon')))
-        # Tags
-        tags_xml = list(node_xml.findall('tag'))
-        nodes_bytes += struct.pack('>H', len(tags_xml))
-        for tag_xml in tags_xml:
-            key = get_str_id(strcache, tag_xml.get('k'))
-            value = get_str_id(strcache, tag_xml.get('v'))
-            nodes_bytes += struct.pack('>HH', key, value)
-
-    # Convert ways to bytes
-    ways_bytes = b''
-    ways_xml = list(ways_xml.findall('way'))
-    ways_bytes += struct.pack('>I', len(ways_xml))
-    for way_xml in ways_xml:
-        # ID
-        ways_bytes += struct.pack('>Q', int(way_xml.get('id')))
-        # Nodes
-        way_nodes_xml = way_xml.findall('nd')
-        ways_bytes += struct.pack('>H', len(way_nodes_xml))
-        for way_node_xml in way_nodes_xml:
-            ways_bytes += struct.pack('>Q', int(way_node_xml.get('ref')))
-        # Tags
-        tags_xml = list(way_xml.findall('tag'))
-        ways_bytes += struct.pack('>H', len(tags_xml))
-        for tag_xml in tags_xml:
-            key = get_str_id(strcache, tag_xml.get('k'))
-            value = get_str_id(strcache, tag_xml.get('v'))
-            ways_bytes += struct.pack('>HH', key, value)
-
-    # Form the final bytes
-    data = b''
-    # Version
-    data += struct.pack('>H', 0)
-    # String cache
-    data += struct.pack('>H', len(strcache))
-    for s in strcache:
-        s = s.encode('utf8')
-        data += struct.pack('>H', len(s))
-        data += s
-    # Nodes and ways
-    data += nodes_bytes
-    data += ways_bytes
-
-    # If custom data should be built
-    custom_data = None
-    if func_path:
-        mod_name, func_name = func_path.rsplit('.', 1)
-        mod = importlib.import_module(mod_name)
-        func = getattr(mod, func_name)
-        custom_data = func(bytes_to_rich_data(data))
-
-    Chunk.objects.create(
-        lat=lat,
-        lon=lon,
-        data=data,
-        custom_data=custom_data,
-    )
+        Chunk.objects.create(
+            lat=lat,
+            lon=lon,
+            data=data,
+            custom_data=custom_data,
+        )
 
     if func_path:
         return HttpResponse(custom_data, content_type='application/octet-stream')
